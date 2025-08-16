@@ -16,18 +16,31 @@
 (define-constant ERR_INVALID_SERVICE_TIER (err u114))
 (define-constant ERR_BOOKING_NOT_ACTIVE (err u115))
 (define-constant ERR_REFUND_ALREADY_PROCESSED (err u116))
+(define-constant ERR_QUALIFICATION_NOT_FOUND (err u117))
+(define-constant ERR_QUALIFICATION_ALREADY_EXISTS (err u118))
+(define-constant ERR_INVALID_SKILL_CATEGORY (err u119))
+(define-constant ERR_ASSESSMENT_NOT_FOUND (err u120))
+(define-constant ERR_ASSESSMENT_ALREADY_COMPLETED (err u121))
+(define-constant ERR_INVALID_ASSESSMENT_SCORE (err u122))
+(define-constant ERR_QUALIFICATION_EXPIRED (err u123))
+(define-constant ERR_INSUFFICIENT_SKILL_LEVEL (err u124))
 
 (define-non-fungible-token guide-badge uint)
 (define-non-fungible-token review-nft uint)
 (define-non-fungible-token booking-nft uint)
+(define-non-fungible-token qualification-certificate uint)
 
 (define-data-var next-guide-id uint u1)
 (define-data-var next-review-id uint u1)
 (define-data-var next-booking-id uint u1)
+(define-data-var next-qualification-id uint u1)
+(define-data-var next-assessment-id uint u1)
 (define-data-var registration-fee uint u1000000)
 (define-data-var platform-fee-percent uint u5)
 (define-data-var cancellation-window-blocks uint u144)
 (define-data-var dispute-window-blocks uint u1008)
+(define-data-var qualification-validity-blocks uint u52560)
+(define-data-var assessment-fee uint u500000)
 
 (define-map guides
   uint
@@ -95,6 +108,67 @@
 (define-map booking-participants uint (list 20 principal))
 (define-map guide-earnings principal uint)
 (define-map platform-earnings principal uint)
+
+(define-map qualifications
+  uint
+  {
+    guide-id: uint,
+    skill-category: uint,
+    qualification-type: (string-ascii 100),
+    description: (string-ascii 300),
+    issuing-authority: (string-ascii 100),
+    certification-date: uint,
+    expiry-date: uint,
+    verification-status: uint,
+    verification-date: uint,
+    evidence-hash: (string-ascii 64),
+    skill-level: uint,
+    is-active: bool
+  }
+)
+
+(define-map skill-assessments
+  uint
+  {
+    guide-id: uint,
+    skill-category: uint,
+    assessor: principal,
+    assessment-date: uint,
+    practical-score: uint,
+    theory-score: uint,
+    overall-score: uint,
+    assessment-notes: (string-ascii 500),
+    status: uint,
+    certification-earned: bool
+  }
+)
+
+(define-map guide-qualifications
+  principal
+  {
+    total-qualifications: uint,
+    verified-qualifications: uint,
+    skill-categories: (list 10 uint),
+    overall-skill-rating: uint,
+    last-assessment-date: uint,
+    certification-level: uint
+  }
+)
+
+(define-map skill-categories
+  uint
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    required-assessments: uint,
+    min-score-threshold: uint,
+    is-active: bool
+  }
+)
+
+(define-map guide-skill-scores principal (list 10 {category: uint, score: uint, level: uint}))
+(define-map qualification-assessments uint (list 5 uint))
+(define-map guide-assessments principal (list 20 uint))
 
 (define-public (register-as-guide (name (string-ascii 50)) (location (string-ascii 100)) (specialties (string-ascii 200)))
   (let
@@ -666,3 +740,298 @@
     none
   )
 )
+
+(define-public (create-skill-category (category-id uint) (name (string-ascii 50)) (description (string-ascii 200)) (required-assessments uint) (min-score-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (map-get? skill-categories category-id)) ERR_QUALIFICATION_ALREADY_EXISTS)
+    (asserts! (and (>= min-score-threshold u1) (<= min-score-threshold u100)) ERR_INVALID_ASSESSMENT_SCORE)
+    
+    (map-set skill-categories category-id
+      {
+        name: name,
+        description: description,
+        required-assessments: required-assessments,
+        min-score-threshold: min-score-threshold,
+        is-active: true
+      }
+    )
+    
+    (ok category-id)
+  )
+)
+
+(define-public (submit-qualification (guide-id uint) (skill-category uint) (qualification-type (string-ascii 100)) (description (string-ascii 300)) (issuing-authority (string-ascii 100)) (certification-date uint) (expiry-date uint) (evidence-hash (string-ascii 64)) (skill-level uint))
+  (let
+    (
+      (qualification-id (var-get next-qualification-id))
+      (guide-data (unwrap! (map-get? guides guide-id) ERR_GUIDE_NOT_FOUND))
+      (category-data (unwrap! (map-get? skill-categories skill-category) ERR_INVALID_SKILL_CATEGORY))
+      (current-qualifications (default-to {total-qualifications: u0, verified-qualifications: u0, skill-categories: (list), overall-skill-rating: u0, last-assessment-date: u0, certification-level: u0} (map-get? guide-qualifications tx-sender)))
+    )
+    (asserts! (is-eq tx-sender (get owner guide-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active category-data) ERR_INVALID_SKILL_CATEGORY)
+    (asserts! (and (>= skill-level u1) (<= skill-level u5)) ERR_INSUFFICIENT_SKILL_LEVEL)
+    (asserts! (> expiry-date stacks-block-height) ERR_QUALIFICATION_EXPIRED)
+    
+    (map-set qualifications qualification-id
+      {
+        guide-id: guide-id,
+        skill-category: skill-category,
+        qualification-type: qualification-type,
+        description: description,
+        issuing-authority: issuing-authority,
+        certification-date: certification-date,
+        expiry-date: expiry-date,
+        verification-status: u1,
+        verification-date: u0,
+        evidence-hash: evidence-hash,
+        skill-level: skill-level,
+        is-active: true
+      }
+    )
+    
+    (map-set guide-qualifications tx-sender
+      (merge current-qualifications {total-qualifications: (+ (get total-qualifications current-qualifications) u1)})
+    )
+    
+    (var-set next-qualification-id (+ qualification-id u1))
+    (ok qualification-id)
+  )
+)
+
+(define-public (verify-qualification (qualification-id uint) (approved bool))
+  (let
+    (
+      (qualification-data (unwrap! (map-get? qualifications qualification-id) ERR_QUALIFICATION_NOT_FOUND))
+      (guide-data (unwrap! (map-get? guides (get guide-id qualification-data)) ERR_GUIDE_NOT_FOUND))
+      (current-qualifications (default-to {total-qualifications: u0, verified-qualifications: u0, skill-categories: (list), overall-skill-rating: u0, last-assessment-date: u0, certification-level: u0} (map-get? guide-qualifications (get owner guide-data))))
+      (verification-status (if approved u2 u3))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get verification-status qualification-data) u1) ERR_ASSESSMENT_ALREADY_COMPLETED)
+    
+    (map-set qualifications qualification-id
+      (merge qualification-data
+        {
+          verification-status: verification-status,
+          verification-date: stacks-block-height
+        }
+      )
+    )
+    
+    (if approved
+      (begin
+        (try! (nft-mint? qualification-certificate qualification-id (get owner guide-data)))
+        (map-set guide-qualifications (get owner guide-data)
+          (merge current-qualifications {verified-qualifications: (+ (get verified-qualifications current-qualifications) u1)})
+        )
+      )
+      true
+    )
+    
+    (ok approved)
+  )
+)
+
+(define-public (schedule-assessment (guide-id uint) (skill-category uint) (assessor principal))
+  (let
+    (
+      (assessment-id (var-get next-assessment-id))
+      (guide-data (unwrap! (map-get? guides guide-id) ERR_GUIDE_NOT_FOUND))
+      (category-data (unwrap! (map-get? skill-categories skill-category) ERR_INVALID_SKILL_CATEGORY))
+      (fee-amount (var-get assessment-fee))
+      (current-assessments (default-to (list) (map-get? guide-assessments tx-sender)))
+    )
+    (asserts! (is-eq tx-sender (get owner guide-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active category-data) ERR_INVALID_SKILL_CATEGORY)
+    
+    (try! (stx-transfer? fee-amount tx-sender CONTRACT_OWNER))
+    
+    (map-set skill-assessments assessment-id
+      {
+        guide-id: guide-id,
+        skill-category: skill-category,
+        assessor: assessor,
+        assessment-date: stacks-block-height,
+        practical-score: u0,
+        theory-score: u0,
+        overall-score: u0,
+        assessment-notes: "",
+        status: u1,
+        certification-earned: false
+      }
+    )
+    
+    (map-set guide-assessments tx-sender
+      (unwrap! (as-max-len? (append current-assessments assessment-id) u20) ERR_ASSESSMENT_NOT_FOUND)
+    )
+    
+    (var-set next-assessment-id (+ assessment-id u1))
+    (ok assessment-id)
+  )
+)
+
+(define-public (complete-assessment (assessment-id uint) (practical-score uint) (theory-score uint) (assessment-notes (string-ascii 500)))
+  (let
+    (
+      (assessment-data (unwrap! (map-get? skill-assessments assessment-id) ERR_ASSESSMENT_NOT_FOUND))
+      (category-data (unwrap! (map-get? skill-categories (get skill-category assessment-data)) ERR_INVALID_SKILL_CATEGORY))
+      (guide-data (unwrap! (map-get? guides (get guide-id assessment-data)) ERR_GUIDE_NOT_FOUND))
+      (overall-score (/ (+ practical-score theory-score) u2))
+      (min-threshold (get min-score-threshold category-data))
+      (certification-earned (>= overall-score min-threshold))
+      (current-qualifications (default-to {total-qualifications: u0, verified-qualifications: u0, skill-categories: (list), overall-skill-rating: u0, last-assessment-date: u0, certification-level: u0} (map-get? guide-qualifications (get owner guide-data))))
+      (current-scores (default-to (list) (map-get? guide-skill-scores (get owner guide-data))))
+      (skill-level (if (>= overall-score u90) u5 (if (>= overall-score u80) u4 (if (>= overall-score u70) u3 (if (>= overall-score u60) u2 u1)))))
+    )
+    (asserts! (is-eq tx-sender (get assessor assessment-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status assessment-data) u1) ERR_ASSESSMENT_ALREADY_COMPLETED)
+    (asserts! (and (>= practical-score u0) (<= practical-score u100)) ERR_INVALID_ASSESSMENT_SCORE)
+    (asserts! (and (>= theory-score u0) (<= theory-score u100)) ERR_INVALID_ASSESSMENT_SCORE)
+    
+    (map-set skill-assessments assessment-id
+      (merge assessment-data
+        {
+          practical-score: practical-score,
+          theory-score: theory-score,
+          overall-score: overall-score,
+          assessment-notes: assessment-notes,
+          status: u2,
+          certification-earned: certification-earned
+        }
+      )
+    )
+    
+    (map-set guide-skill-scores (get owner guide-data)
+      (unwrap! (as-max-len? (append current-scores {category: (get skill-category assessment-data), score: overall-score, level: skill-level}) u10) ERR_INVALID_SKILL_CATEGORY)
+    )
+    
+    (map-set guide-qualifications (get owner guide-data)
+      (merge current-qualifications {last-assessment-date: stacks-block-height})
+    )
+    
+    (ok certification-earned)
+  )
+)
+
+(define-public (update-certification-level (guide-owner principal))
+  (let
+    (
+      (current-qualifications (default-to {total-qualifications: u0, verified-qualifications: u0, skill-categories: (list), overall-skill-rating: u0, last-assessment-date: u0, certification-level: u0} (map-get? guide-qualifications guide-owner)))
+      (skill-scores (default-to (list) (map-get? guide-skill-scores guide-owner)))
+      (verified-count (get verified-qualifications current-qualifications))
+      (total-score (fold calculate-total-score skill-scores u0))
+      (score-count (len skill-scores))
+      (average-score (if (> score-count u0) (/ total-score score-count) u0))
+      (certification-level (if (and (>= verified-count u5) (>= average-score u85)) u3 (if (and (>= verified-count u3) (>= average-score u75)) u2 (if (and (>= verified-count u1) (>= average-score u65)) u1 u0))))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    (map-set guide-qualifications guide-owner
+      (merge current-qualifications
+        {
+          overall-skill-rating: average-score,
+          certification-level: certification-level
+        }
+      )
+    )
+    
+    (ok certification-level)
+  )
+)
+
+(define-public (set-assessment-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set assessment-fee new-fee)
+    (ok true)
+  )
+)
+
+(define-public (set-qualification-validity (new-validity-blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set qualification-validity-blocks new-validity-blocks)
+    (ok true)
+  )
+)
+
+(define-private (calculate-total-score (score-entry {category: uint, score: uint, level: uint}) (total uint))
+  (+ total (get score score-entry))
+)
+
+(define-read-only (get-qualification (qualification-id uint))
+  (map-get? qualifications qualification-id)
+)
+
+(define-read-only (get-skill-assessment (assessment-id uint))
+  (map-get? skill-assessments assessment-id)
+)
+
+(define-read-only (get-guide-qualifications (guide-owner principal))
+  (map-get? guide-qualifications guide-owner)
+)
+
+(define-read-only (get-skill-category (category-id uint))
+  (map-get? skill-categories category-id)
+)
+
+(define-read-only (get-guide-skill-scores (guide-owner principal))
+  (map-get? guide-skill-scores guide-owner)
+)
+
+(define-read-only (get-guide-assessments (guide-owner principal))
+  (map-get? guide-assessments guide-owner)
+)
+
+(define-read-only (get-qualification-certificate-owner (qualification-id uint))
+  (nft-get-owner? qualification-certificate qualification-id)
+)
+
+(define-read-only (get-next-qualification-id)
+  (var-get next-qualification-id)
+)
+
+(define-read-only (get-next-assessment-id)
+  (var-get next-assessment-id)
+)
+
+(define-read-only (get-assessment-fee)
+  (var-get assessment-fee)
+)
+
+(define-read-only (get-qualification-validity)
+  (var-get qualification-validity-blocks)
+)
+
+(define-read-only (check-qualification-validity (qualification-id uint))
+  (match (map-get? qualifications qualification-id)
+    qualification-data
+    (and 
+      (get is-active qualification-data)
+      (> (get expiry-date qualification-data) stacks-block-height)
+      (is-eq (get verification-status qualification-data) u2)
+    )
+    false
+  )
+)
+
+(define-read-only (get-guide-certification-summary (guide-owner principal))
+  (let
+    (
+      (qualifications-data (default-to {total-qualifications: u0, verified-qualifications: u0, skill-categories: (list), overall-skill-rating: u0, last-assessment-date: u0, certification-level: u0} (map-get? guide-qualifications guide-owner)))
+      (skill-scores (default-to (list) (map-get? guide-skill-scores guide-owner)))
+    )
+    {
+      total-qualifications: (get total-qualifications qualifications-data),
+      verified-qualifications: (get verified-qualifications qualifications-data),
+      certification-level: (get certification-level qualifications-data),
+      overall-skill-rating: (get overall-skill-rating qualifications-data),
+      skill-categories-count: (len (get skill-categories qualifications-data)),
+      last-assessment: (get last-assessment-date qualifications-data)
+    }
+  )
+)
+
+
